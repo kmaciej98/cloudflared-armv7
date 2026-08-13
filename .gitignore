@@ -1,0 +1,23 @@
+# Exported images / build output
+*.tar
+*.tar.gz
+*.tgz
+dist/
+out/
+
+# Secrets — never commit tunnel tokens or credentials
+*.token
+*.env
+.env
+.env.*
+!.env.example
+cert.pem
+*credentials*.json
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

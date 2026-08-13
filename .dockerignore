@@ -1,0 +1,3 @@
+# The build context is not used at all — everything is fetched in the
+# Dockerfile — so keep it empty for fast, cache-friendly builds.
+*
