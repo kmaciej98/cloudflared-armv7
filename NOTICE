@@ -1,0 +1,26 @@
+cloudflared-armv7
+=================
+
+This repository packages the official `cloudflared` release binary for 32-bit
+ARM (armhf / armv7) into a container image. It is an unofficial community
+build and is not affiliated with, endorsed by, or supported by Cloudflare, Inc.
+
+The packaging in this repository (Dockerfile, workflows, scripts,
+documentation) is distributed under the MIT License — see LICENSE.
+
+The binary shipped inside the resulting image is `cloudflared`:
+
+    https://github.com/cloudflare/cloudflared
+    Copyright (C) Cloudflare, Inc.
+    Licensed under the Apache License, Version 2.0
+
+It is downloaded unmodified from the official GitHub release assets
+(`cloudflared-linux-armhf`) at build time, and its checksum is verified against
+the checksums published in the upstream release notes. A copy of the upstream
+Apache-2.0 license is included in the image at:
+
+    /usr/local/share/licenses/cloudflared/LICENSE
+
+"Cloudflare", "Cloudflare Tunnel" and "cloudflared" are trademarks of
+Cloudflare, Inc. They are used here only to identify the upstream software
+being packaged.

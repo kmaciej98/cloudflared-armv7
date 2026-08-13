@@ -1,0 +1,204 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/build.yml'
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+    inputs:
+      cloudflared_version:
+        description: 'cloudflared release tag (e.g. 2026.7.3) or "latest"'
+        type: string
+        default: latest
+      push:
+        description: 'Push the image to GHCR'
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      cloudflared_version:
+        description: 'cloudflared release tag or "latest"'
+        type: string
+        default: latest
+      push:
+        description: 'Push the image to GHCR'
+        type: boolean
+        default: true
+
+env:
+  REGISTRY: ghcr.io
+  PLATFORM: linux/arm/v7
+
+concurrency:
+  group: build-${{ github.ref }}-${{ inputs.cloudflared_version || 'latest' }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.cloudflared_version || 'latest' }}
+        run: |
+          set -euo pipefail
+          newest=$(gh api repos/cloudflare/cloudflared/releases/latest --jq .tag_name)
+          if [ -z "$REQUESTED" ] || [ "$REQUESTED" = "latest" ]; then
+            tag="$newest"
+          else
+            tag="$REQUESTED"
+          fi
+          # Only the newest upstream release may claim the :latest tag, so that
+          # rebuilding an older release by hand cannot move :latest backwards.
+          if [ "$tag" = "$newest" ]; then is_latest=true; else is_latest=false; fi
+          body=$(gh api "repos/cloudflare/cloudflared/releases/tags/$tag" --jq .body)
+          sha=$(printf '%s' "$body" \
+            | grep -oE 'cloudflared-linux-armhf:[[:space:]]*[0-9a-f]{64}' \
+            | grep -oE '[0-9a-f]{64}' \
+            | head -n1 || true)
+          if [ -z "$sha" ]; then
+            echo "::error::Release $tag does not list a cloudflared-linux-armhf checksum — either the 32-bit ARM build was dropped or the release notes changed format. No image is built or published for this release."
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "is_latest=$is_latest" >> "$GITHUB_OUTPUT"
+          echo "Building cloudflared $tag (sha256: $sha, newest upstream: $newest)"
+
+      - name: Check that the release ships a supported 32-bit ARM binary
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          SHA256: ${{ steps.release.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          asset="$RUNNER_TEMP/cloudflared-linux-armhf"
+          url="https://github.com/cloudflare/cloudflared/releases/download/$VERSION/cloudflared-linux-armhf"
+          if ! curl -fsSL --retry 5 --retry-delay 2 -o "$asset" "$url"; then
+            echo "::error::cloudflared $VERSION does not publish a cloudflared-linux-armhf asset — no image is built or published for this release. The tags already in the registry are unaffected."
+            exit 1
+          fi
+          echo "$SHA256  $asset" | sha256sum -c -
+          if ! scripts/check-binary.sh "$asset"; then
+            echo "::error::cloudflared $VERSION does not ship a supported armv7 (32-bit hard-float ARM) binary — no image is built or published for this release. The tags already in the registry are unaffected."
+            exit 1
+          fi
+
+      - name: Compute image name and tags
+        id: meta
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          IS_LATEST: ${{ steps.release.outputs.is_latest }}
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          tags="$image:$VERSION"
+          [ "$IS_LATEST" = "true" ] && tags="$tags $image:latest"
+          {
+            echo "image=$image"
+            echo "primary=$image:$VERSION"
+            echo "tags=$tags"
+            echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ env.PLATFORM }}
+          # Load into the local daemon so the binary can be smoke-tested before
+          # anything is published; the verified image is pushed as-is below.
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          build-args: |
+            CLOUDFLARED_VERSION=${{ steps.release.outputs.version }}
+            CLOUDFLARED_SHA256=${{ steps.release.outputs.sha256 }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+            SOURCE_URL=${{ github.server_url }}/${{ github.repository }}
+          tags: ${{ steps.meta.outputs.primary }}
+          cache-from: type=gha
+          # Forked pull requests get a read-only token; a failed cache export
+          # must not fail the build.
+          cache-to: type=gha,mode=max,ignore-error=true
+
+      - name: Verify architecture and binary
+        env:
+          IMAGE: ${{ steps.meta.outputs.primary }}
+          EXPECTED_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          arch=$(docker image inspect "$IMAGE" --format '{{.Architecture}}/{{.Variant}}')
+          echo "Image architecture: $arch"
+          [ "$arch" = "arm/v7" ] || { echo "::error::Unexpected image architecture: $arch"; exit 1; }
+          out=$(docker run --rm --platform "$PLATFORM" "$IMAGE" --version)
+          echo "$out"
+          case "$out" in
+            *"$EXPECTED_VERSION"*) ;;
+            *) echo "::error::cloudflared reported an unexpected version"; exit 1 ;;
+          esac
+
+      - name: Push image
+        id: publish
+        if: github.event_name != 'pull_request' && (inputs.push == null || inputs.push)
+        env:
+          PRIMARY: ${{ steps.meta.outputs.primary }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          for tag in $TAGS; do
+            [ "$tag" = "$PRIMARY" ] || docker tag "$PRIMARY" "$tag"
+            docker push "$tag"
+          done
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          SHA256: ${{ steps.release.outputs.sha256 }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          PUBLISHED: ${{ steps.publish.outcome }}
+        run: |
+          {
+            echo "### cloudflared $VERSION (linux/arm/v7)"
+            echo
+            echo "Upstream binary sha256: \`$SHA256\`"
+            echo
+            if [ "$PUBLISHED" = "success" ]; then
+              echo "Pushed tags:"
+              for tag in $TAGS; do echo "- \`$tag\`"; done
+            else
+              echo "Built without publishing. Tags that a push would have"
+              echo "produced:"
+              for tag in $TAGS; do echo "- \`$tag\`"; done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

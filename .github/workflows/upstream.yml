@@ -1,0 +1,56 @@
+name: upstream-watch
+
+# Checks daily whether Cloudflare published a new cloudflared release that has
+# not been built yet, and rebuilds/publishes the image if so.
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      needed: ${{ steps.check.outputs.needed }}
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compare latest release with published tags
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(gh api repos/cloudflare/cloudflared/releases/latest --jq .tag_name)
+          image="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "Latest upstream release: $version"
+          if docker buildx imagetools inspect "$image:$version" >/dev/null 2>&1; then
+            echo "$image:$version already published — nothing to do"
+            needed=false
+          else
+            echo "$image:$version is missing — a build will be triggered"
+            needed=true
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "needed=$needed" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.needed == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build.yml
+    with:
+      cloudflared_version: ${{ needs.check.outputs.version }}
+      push: true
